@@ -1,7 +1,7 @@
 [workspace]
 authors = ["lenzpracher <lenz.pracher@gmail.com>"]
 channels = ["conda-forge"]
-name = "neurips-neural-operators"
+name = "SpectralProject"
 platforms = ["linux-64"]
 version = "0.1.0"
 
@@ -9,62 +9,39 @@ version = "0.1.0"
 cuda = "12.8"
 
 [tasks]
-acli = "acli/acli_0.1.2_linux_arm64/acli"
+# 1D Experiments (20 parallel runs, auto-plots)
+burgers = "python burgers_1d.py --mode parallel-train"
+burgers-plot = "python burgers_1d.py --mode parallel-plot"
 
-# Run experiments (multi-seed by default for statistical robustness)
-burgers = "python run_experiments.py --equation burgers --model loco"
-kdv = "python run_experiments.py --equation kdv --model fno"
-ns2d = "python run_experiments.py --equation ns2d --model hybrid"
+kdv = "python kdv_1d.py --mode parallel-train"
+kdv-plot = "python kdv_1d.py --mode parallel-plot"
 
-# Quick tests (3 seeds, fewer epochs for faster testing)
-test-burgers = "python run_experiments.py --equation burgers --model loco --n_train 100 --n_test 20 --epochs 10 --n_seeds 3"
-test-kdv = "python run_experiments.py --equation kdv --model fno --n_train 100 --n_test 20 --epochs 10 --n_seeds 3"
-test-ns2d = "python run_experiments.py --equation ns2d --model hybrid --n_train 50 --n_test 10 --epochs 10 --n_seeds 3"
+# 2D Experiments (5 parallel runs, auto-plots)
+ns2d = "python navier_stokes_2d.py --mode parallel-train"
+ns2d-plot = "python navier_stokes_2d.py --mode parallel-plot"
+ns2d-rollout = "python navier_stokes_2d.py --mode rollout-loss"
 
-# Full comparisons (all models with 5 seeds each)
-compare-burgers = "python run_experiments.py --equation burgers --model all --n_seeds 5"
-compare-kdv = "python run_experiments.py --equation kdv --model all --n_seeds 5"
-compare-ns2d = "python run_experiments.py --equation ns2d --model all --n_seeds 5"
+# Data Aggregation - Convert individual run files to efficient single files
+aggregate-data = "python aggregate_data.py --experiment all"
 
-# Generate all results (WARNING: takes a long time!)
-generate-all = "python run_experiments.py --equation all --model all --n_seeds 5"
-
-# Single seed mode (for quick debugging only)
-single-burgers = "python run_experiments.py --equation burgers --model loco --n_seeds 1"
-
-# Help
-help = "python run_experiments.py --help"
-
-# Testing tasks
-test = "python run_tests.py"
-test-quick = "python run_tests.py --quick"
-test-full = "python run_tests.py --full" 
-test-models = "python run_tests.py --models"
-test-solvers = "python run_tests.py --solvers"
-test-utils = "python run_tests.py --utils"
-test-coverage = "python run_tests.py --coverage"
-
-# Direct pytest commands
-pytest = "python -m pytest"
-pytest-verbose = "python -m pytest -v"
+# Code Quality
+lint = "ruff check ."
+lint-fix = "ruff check --fix . && ruff format ."
 
 [dependencies]
 pytorch-gpu = "*"
 python = ">=3.13.5,<3.14"
-numpy = ">=2.3.0,<3"
+numpy = ">=2.3.2,<3"
 matplotlib = ">=3.10.3,<4"
 tqdm = ">=4.67.1,<5"
 scipy = ">=1.15.2,<2"
 seaborn = ">=0.13.2,<0.14"
-imageio = ">=2.37.0,<3"
+pytest = ">=8.4.1,<9"
+imageio = ">=2.36.1,<3"
+huggingface_hub = ">=0.34.4,<0.35"
 gpustat = ">=1.1.1,<2"
-btop = ">=1.4.4,<2"
-jira-with-cli = ">=3.8.0,<4"
-openjdk = "17.*"
-scikit-learn = ">=1.7.1,<2"
-nodejs = ">=24.4.1,<24.5"
+ruff = ">=0.8.0,<1"
+pre-commit = ">=4.0.0,<5"
 
 [pypi-dependencies]
 neuraloperator = "*"
-pytest = ">=7.0.0"
-pytest-cov = ">=4.0.0"

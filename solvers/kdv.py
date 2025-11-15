@@ -1,37 +1,35 @@
 """
-Korteweg-de Vries (KdV) equation solver for data generation.
+1D Korteweg-de Vries (KdV) Equation Solver
 
-Implements a GPU-accelerated 1D KdV solver using a conservative Fourier split-step method.
-Solves u_t + a*u*u_x + b*u_xxx = 0 with periodic boundary conditions.
-Standard KdV corresponds to a=6, b=1.
+This module provides a GPU-accelerated solver for the 1D KdV equation.
+Extracted from old_scripts/Burgers_KdV/kdv_solver.py for clean organization.
+
+The solver uses a conservative Fourier split-step method:
+- Linear dispersive term: spectral treatment (exact)
+- Nonlinear advection term: real space RK4 treatment
 """
 
-import torch
-import torch.nn.functional as F
 import numpy as np
+import torch
 from tqdm import tqdm
-import os
-from typing import Optional, Tuple
 
 
 class KdVSolver:
     """
     GPU-accelerated, vectorized KdV solver using a conservative Fourier split-step method.
-    Solves u_t + a*u*u_x + b*u_xxx = 0.
+
+    Solves: u_t + a*u*u_x + b*u_xxx = 0
     Standard KdV corresponds to a=6, b=1.
+
+    Args:
+        N: Number of spatial grid points
+        width: Spatial domain width
+        a: Nonlinear coefficient (default: 6.0)
+        b: Dispersion coefficient (default: 1.0)
+        device: Computing device ('cpu' or 'cuda:X')
     """
 
-    def __init__(self, N: int = 128, width: float = 2 * np.pi, a: float = 6.0, b: float = 1.0, device: str = "cpu"):
-        """
-        Initialize the KdV solver.
-        
-        Args:
-            N: Number of spatial points
-            width: Spatial domain width
-            a: Nonlinear coefficient (standard KdV: a=6)
-            b: Dispersion coefficient (standard KdV: b=1)
-            device: Device to run computations on
-        """
+    def __init__(self, N=128, width=2*np.pi, a=6.0, b=1.0, device="cpu"):
         self.N = N
         self.width = width
         self.dx = width / N
@@ -41,11 +39,13 @@ class KdVSolver:
 
         # Wavenumbers for spectral differentiation
         k = 2 * np.pi * torch.fft.fftfreq(N, d=self.dx).to(device)
-        self.k = k.view(1, 1, -1)  # Shape for broadcasting over batches
+        # Reshape for broadcasting over batches and channels
+        self.k = k.view(1, 1, -1)
         self.ik = 1j * self.k
 
         # Precompute the linear operator for the split-step method
-        # Linear part: u_t = -b * u_xxx → u_hat_t = i * b * k^3 * u_hat
+        # Equation for the linear part: u_t = -b * u_xxx
+        # In Fourier space: u_hat_t = -b * (ik)^3 * u_hat = i * b * k^3 * u_hat
         self.linear_operator = 1j * self.b * self.k**3
 
     def _nonlinear_dudt(self, u):
@@ -70,8 +70,9 @@ class KdVSolver:
         # Full step on linear part in Fourier space
         u_half_1_hat = torch.fft.fft(u_half_1, dim=-1)
 
-        # Dealiasing: Zero out the highest 1/3 of frequencies
-        k_max_dealias = int(self.N * (1 / 3))
+        # Dealiasing: Zero out the highest 1/3 of frequencies to prevent aliasing instability
+        N = self.N
+        k_max_dealias = int(N * (1 / 3))
         u_half_1_hat[..., k_max_dealias:-k_max_dealias] = 0
 
         u_hat_linear = u_half_1_hat * torch.exp(self.linear_operator * dt)
@@ -82,227 +83,231 @@ class KdVSolver:
 
         return u_next.real
 
-    def integrate(self, u0: torch.Tensor, t_eval: torch.Tensor) -> Optional[torch.Tensor]:
+    def integrate(self, u0, t_eval):
         """
         Integrates a batch of initial conditions.
-        
+
         Args:
             u0: Initial conditions, shape (batch_size, N) or (batch_size, 1, N)
-            t_eval: Time points to evaluate at, shape (n_time,)
-            
+            t_eval: 1D tensor of time points
+
         Returns:
-            Solution tensor of shape (batch_size, n_time, N) or None if divergence occurs
+            Solution tensor (batch_size, time, N) or None if divergence occurs
         """
         if len(u0.shape) == 2:
             u0 = u0.unsqueeze(1)  # Add channel dim: (batch, 1, N)
 
         u = u0
-        sol = [u.squeeze(1)]  # Remove channel dim for storage
 
-        for i in range(len(t_eval) - 1):
+        # Store initial state
+        sol = [u.squeeze(1)]  # Squeeze out channel dim for storage
+
+        pbar = tqdm(range(len(t_eval) - 1), desc=f"Integrating on {u.device}", leave=False)
+        for i in pbar:
             dt = t_eval[i + 1] - t_eval[i]
             u = self._strang_splitting_step(u, dt)
 
             # Check for divergence
             if not torch.isfinite(u).all():
-                print(f"WARNING: Divergence detected at time step {i}")
-                return None
+                print(f"\\nWARNING: Divergence detected on device {u.device} at time step {i}. Aborting batch.")
+                return None  # Indicate failure
 
             sol.append(u.squeeze(1))
 
         return torch.stack(sol, dim=1)  # (batch, time, N)
 
     def get_mass(self, u):
-        """Mass (first conserved quantity): ∫u dx"""
+        """Mass (M = ∫u dx)"""
         return u.sum(dim=-1) * self.dx
 
     def get_momentum(self, u):
-        """Momentum (second conserved quantity): ∫u^2 dx"""
+        """Momentum (P = ∫u^2 dx) - standard definition"""
         return (u**2).sum(dim=-1) * self.dx
 
     def get_energy(self, u):
-        """Energy (third conserved quantity): ∫(u^3 - (u_x)^2) dx"""
+        """Hamiltonian/Energy (H = ∫(b/2 * u_x^2 - a/6 * u^3) dx)"""
         u_hat = torch.fft.fft(u, dim=-1)
-        u_x = torch.fft.ifft(self.ik.squeeze() * u_hat, dim=-1).real
-        integrand = u**3 - u_x**2
+        u_x = torch.fft.ifft(self.ik * u_hat, dim=-1).real
+
+        integrand = (self.b / 2.0) * u_x**2 - (self.a / 6.0) * u**3
         return integrand.sum(dim=-1) * self.dx
 
 
-def generate_soliton_initial_conditions(n_samples: int, N: int = 128, device: str = "cpu") -> torch.Tensor:
+def generate_kdv_initial_conditions(num_runs, N, width=2*np.pi, seed=None, device="cpu"):
     """
-    Generate soliton-based initial conditions for KdV equation.
-    
-    Uses combinations of solitons with random parameters.
-    
+    Generate initial conditions for KdV equation (two-soliton superposition)
+
     Args:
-        n_samples: Number of initial conditions to generate
-        N: Number of spatial points
-        device: Device to generate on
-        
+        num_runs: Number of initial conditions to generate
+        N: Number of spatial grid points
+        width: Spatial domain width
+        seed: Random seed for reproducibility
+        device: Computing device
+
     Returns:
-        Initial conditions tensor of shape (n_samples, N)
+        Tensor of initial conditions (num_runs, N)
     """
-    x = torch.linspace(-np.pi, np.pi, N, device=device)
-    u0_list = []
-    
-    for _ in range(n_samples):
-        # Random number of solitons (1-3)
-        n_solitons = np.random.randint(1, 4)
-        u0 = torch.zeros(N, device=device)
-        
-        for _ in range(n_solitons):
-            # Random soliton parameters
-            amplitude = np.random.uniform(0.5, 3.0)  # Height
-            center = np.random.uniform(-np.pi/2, np.pi/2)  # Position
-            width = np.random.uniform(0.3, 1.0)  # Width parameter
-            
-            # Soliton formula: amplitude * sech^2(sqrt(amplitude/12) * (x - center) / width)
-            arg = np.sqrt(amplitude / 12) * (x - center) / width
-            soliton = amplitude * (1 / torch.cosh(arg))**2
-            u0 += soliton
-            
-        u0_list.append(u0)
-    
-    return torch.stack(u0_list)
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    x = torch.arange(N, device=device) * (width / N)
+    ics = []
+
+    for _i in range(num_runs):
+        c1 = torch.rand(1, device=device) * 1.5 + 0.5  # Speed/amplitude
+        c2 = torch.rand(1, device=device) * 1.5 + 0.5
+        x1 = torch.rand(1, device=device) * width
+        x2 = torch.rand(1, device=device) * width
+
+        # Ensure solitons are somewhat separated
+        if torch.abs(x1 - x2) < width / 4:
+            x2 = (x1 + width / 2) % width
+
+        ic = create_two_soliton_ic(x, c1, x1, c2, x2)
+        ics.append(ic)
+
+    return torch.stack(ics, dim=0)  # (num_runs, N)
 
 
-def generate_random_initial_conditions(n_samples: int, N: int = 128, device: str = "cpu") -> torch.Tensor:
+def create_two_soliton_ic(x, c1, x1, c2, x2):
+    """Generates a two-soliton solution as a torch tensor."""
+    def inverse_cosh(z):
+        return 1 / torch.cosh(z)
+
+    soliton1 = 2 * c1**2 * inverse_cosh(c1 * (x - x1)) ** 2
+    soliton2 = 2 * c2**2 * inverse_cosh(c2 * (x - x2)) ** 2
+    return soliton1 + soliton2
+
+
+def run_kdv_simulation_batch(solver, ics, T, dt, save_interval):
     """
-    Generate random smooth initial conditions for KdV equation.
-    
-    Uses Fourier series with random coefficients.
-    
+    Run a batch of KdV simulations and compute conservation laws
+
     Args:
-        n_samples: Number of initial conditions to generate
-        N: Number of spatial points
-        device: Device to generate on
-        
-    Returns:
-        Initial conditions tensor of shape (n_samples, N)
-    """
-    x = torch.linspace(-np.pi, np.pi, N, device=device)
-    u0_list = []
-    
-    for _ in range(n_samples):
-        # Random Fourier series
-        n_modes = np.random.randint(3, 8)  # 3-7 modes
-        u0 = torch.zeros(N, device=device)
-        
-        for k in range(1, n_modes + 1):
-            amplitude = np.random.uniform(0.1, 1.0) / k  # Decay with frequency
-            phase = np.random.uniform(0, 2*np.pi)
-            u0 += amplitude * torch.sin(k * x + phase)
-            
-        u0_list.append(u0)
-    
-    return torch.stack(u0_list)
-
-
-def generate_kdv_data(
-    n_train: int = 1000,
-    n_test: int = 200, 
-    N: int = 128,
-    T: float = 4.0,
-    dt: float = 0.01,
-    a: float = 6.0,
-    b: float = 1.0,
-    device: str = "cpu",
-    use_solitons: bool = True,
-    save_path: Optional[str] = None
-) -> Tuple[dict, dict]:
-    """
-    Generate training and test datasets for KdV equation.
-    
-    Args:
-        n_train: Number of training samples
-        n_test: Number of test samples
-        N: Number of spatial points
+        solver: KdVSolver instance
+        ics: Initial conditions (batch_size, N)
         T: Final time
-        dt: Time step size
+        dt: Time step
+        save_interval: Interval for saving snapshots
+
+    Returns:
+        List of results dictionaries for each simulation
+    """
+    # Time points for integration and saving
+    t_eval = torch.arange(0, T + dt, dt, device=solver.device)
+    save_times = torch.arange(0, T + save_interval, save_interval, device=solver.device)
+
+    # Run integration
+    snapshots = solver.integrate(ics, t_eval)
+
+    if snapshots is None:
+        return [{"status": "failed", "error_message": "Divergence during integration"} for _ in range(ics.shape[0])]
+
+    # Downsample to save_times
+    save_indices = torch.searchsorted(t_eval, save_times)
+    save_indices.clamp_max_(snapshots.shape[1] - 1)
+    saved_snapshots = snapshots[:, save_indices, :]
+
+    # Compute conservation laws for each saved snapshot
+    mass_t = solver.get_mass(saved_snapshots)
+    momentum_t = solver.get_momentum(saved_snapshots)
+    energy_t = solver.get_energy(saved_snapshots)
+
+    results = []
+    for i in range(ics.shape[0]):
+        results.append({
+            "status": "success",
+            "snapshots": saved_snapshots[i].cpu(),
+            "times": save_times.cpu(),
+            "mass_t": mass_t[i].cpu(),
+            "momentum_t": momentum_t[i].cpu(),
+            "energy_t": energy_t[i].cpu(),
+        })
+    return results
+
+
+def generate_kdv_dataset(
+    num_runs=1000,
+    N=128,
+    width=2*np.pi,
+    a=6.0,
+    b=1.0,
+    T=2.0,
+    dt=0.001,
+    save_interval=0.001,
+    batch_size=32,
+    device='cpu',
+    seed=None,
+    save_dir='data/KdV'
+):
+    """
+    Generate a complete KdV dataset
+
+    Args:
+        num_runs: Number of simulations to run
+        N: Spatial grid points
+        width: Spatial domain width
         a: Nonlinear coefficient
         b: Dispersion coefficient
-        device: Device to run on
-        use_solitons: Whether to use soliton-based initial conditions
-        save_path: Path to save data (optional)
-        
+        T: Final time
+        dt: Time step for integration
+        save_interval: Time interval for saving snapshots
+        batch_size: Batch size for processing
+        device: Computing device
+        seed: Random seed
+        save_dir: Directory to save results
+
     Returns:
-        Tuple of (train_data, test_data) dictionaries
+        Dictionary with dataset statistics
     """
-    print(f"Generating KdV equation data...")
-    print(f"Parameters: N={N}, T={T}, dt={dt}, a={a}, b={b}")
-    print(f"Train samples: {n_train}, Test samples: {n_test}")
-    print(f"Initial conditions: {'soliton-based' if use_solitons else 'random Fourier'}")
-    
-    # Time evaluation points
-    t_eval = torch.arange(0, T + dt, dt, device=device)
-    n_time = len(t_eval)
-    
-    # Initialize solver
-    solver = KdVSolver(N=N, a=a, b=b, device=device)
-    
-    def generate_dataset(n_samples, desc):
-        # Generate initial conditions
-        if use_solitons:
-            u0 = generate_soliton_initial_conditions(n_samples, N, device)
-        else:
-            u0 = generate_random_initial_conditions(n_samples, N, device)
-        
-        # Solve in batches to manage memory
-        batch_size = min(50, n_samples)
-        all_solutions = []
-        
-        for i in tqdm(range(0, n_samples, batch_size), desc=desc):
-            end_idx = min(i + batch_size, n_samples)
-            batch_u0 = u0[i:end_idx]
-            
-            # Integrate
-            sol = solver.integrate(batch_u0, t_eval)
-            if sol is None:
-                raise RuntimeError(f"Integration failed for batch {i//batch_size}")
-                
-            all_solutions.append(sol.cpu())
-        
-        return {
-            'u': torch.cat(all_solutions, dim=0),  # (n_samples, n_time, N)
-            't': t_eval.cpu(),                     # (n_time,)
-            'x': torch.linspace(-np.pi, np.pi, N), # (N,)
-            'a': a,
-            'b': b,
-            'dt': dt
-        }
-    
-    # Generate datasets
-    train_data = generate_dataset(n_train, "Generating train data")
-    test_data = generate_dataset(n_test, "Generating test data")
-    
-    # Save if requested
-    if save_path:
-        os.makedirs(save_path, exist_ok=True)
-        torch.save(train_data, os.path.join(save_path, 'kdv_train.pt'))
-        torch.save(test_data, os.path.join(save_path, 'kdv_test.pt'))
-        print(f"Data saved to {save_path}")
-    
-    print("Data generation complete!")
-    return train_data, test_data
+    import os
+    os.makedirs(save_dir, exist_ok=True)
 
+    # Create solver
+    solver = KdVSolver(N=N, width=width, a=a, b=b, device=device)
 
-def load_kdv_data(data_path: str) -> Tuple[dict, dict]:
-    """Load KdV equation data from saved files."""
-    train_data = torch.load(os.path.join(data_path, 'kdv_train.pt'))
-    test_data = torch.load(os.path.join(data_path, 'kdv_test.pt'))
-    return train_data, test_data
-
-
-if __name__ == "__main__":
-    # Example usage
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_data, test_data = generate_kdv_data(
-        n_train=100,  # Small example
-        n_test=20,
-        device=device,
-        save_path="data"
+    # Generate initial conditions
+    print(f"Generating {num_runs} KdV initial conditions...")
+    all_ics = generate_kdv_initial_conditions(
+        num_runs, N, width=width, seed=seed, device='cpu'  # Generate on CPU first
     )
-    
-    print(f"Train data shape: {train_data['u'].shape}")
-    print(f"Test data shape: {test_data['u'].shape}")
-    print(f"Time points: {len(train_data['t'])}")
+
+    # Process in batches
+    successful_runs = 0
+    failed_runs = 0
+
+    print(f"Running {num_runs} KdV simulations...")
+    for i in tqdm(range(0, num_runs, batch_size), desc="Processing batches"):
+        batch_end = min(i + batch_size, num_runs)
+        batch_ics = all_ics[i:batch_end].to(device)
+
+        # Run batch simulation
+        batch_results = run_kdv_simulation_batch(
+            solver, batch_ics, T, dt, save_interval
+        )
+
+        # Save individual results
+        for j, result in enumerate(batch_results):
+            run_id = i + j
+            result['run_id'] = run_id
+
+            if result['status'] == 'success':
+                save_path = os.path.join(save_dir, f"simulation_run_{run_id}.pt")
+                torch.save(result, save_path)
+                successful_runs += 1
+            else:
+                failed_runs += 1
+
+    stats = {
+        'total_runs': num_runs,
+        'successful_runs': successful_runs,
+        'failed_runs': failed_runs,
+        'success_rate': successful_runs / num_runs,
+        'parameters': {
+            'N': N, 'width': width, 'a': a, 'b': b, 'T': T,
+            'dt': dt, 'save_interval': save_interval
+        }
+    }
+
+    print(f"Dataset generation complete: {successful_runs}/{num_runs} successful")
+    return stats

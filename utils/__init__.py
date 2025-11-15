@@ -1,21 +1,9 @@
-"""Utility functions for training and visualization."""
+"""
+Shared Utilities Package
 
-from .training import train_model, evaluate_model, train_model_multiseed, count_parameters
-from .plotting import (plot_training_losses, plot_predictions, plot_rollout_comparison,
-                       plot_multiseed_training, plot_multiseed_comparison, plot_all_models_training)
-from .data import PDEDataset, generate_data
+This package contains shared utilities used across 1D and 2D experiments.
 
-__all__ = [
-    'train_model',
-    'evaluate_model', 
-    'train_model_multiseed',
-    'count_parameters',
-    'plot_training_losses',
-    'plot_predictions',
-    'plot_rollout_comparison',
-    'plot_multiseed_training',
-    'plot_multiseed_comparison',
-    'plot_all_models_training',
-    'PDEDataset',
-    'generate_data'
-]
+Modules:
+- seeds: Centralized seed definitions for reproducibility
+- shared: Any shared utilities between 1D and 2D implementations
+"""

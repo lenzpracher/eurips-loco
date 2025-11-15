@@ -1,0 +1,32 @@
+Burgers Parallel Training Summary
+Generated: 2025-09-24 22:21:34
+Total Runs: 20
+Models: Hybrid, LOCO, FNO
+Hardcoded Seeds: [42, 123, 456, 789, 1024, 2048, 4096, 8192, 16384, 32768, 12312, 2542, 23452, 1231, 12342315, 5234, 523452, 23452, 65475, 879768]
+
+Run Assignments:
+Run 0: seed=42
+Run 1: seed=123
+Run 2: seed=456
+Run 3: seed=789
+Run 4: seed=1024
+Run 5: seed=2048
+Run 6: seed=4096
+Run 7: seed=8192
+Run 8: seed=16384
+Run 9: seed=32768
+Run 10: seed=12312
+Run 11: seed=2542
+Run 12: seed=23452
+Run 13: seed=1231
+Run 14: seed=12342315
+Run 15: seed=5234
+Run 16: seed=523452
+Run 17: seed=23452
+Run 18: seed=65475
+Run 19: seed=879768
+
+Model Training Results:
+Hybrid: 20 runs completed, mean final val loss: 0.000006 ± 0.000002
+LOCO: 20 runs completed, mean final val loss: 0.000009 ± 0.000004
+FNO: 20 runs completed, mean final val loss: 0.000022 ± 0.000001

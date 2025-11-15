@@ -1,1 +1,0 @@
-"""Test suite for neurips-neural-operators repository."""

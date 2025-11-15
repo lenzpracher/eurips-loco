@@ -1,37 +1,40 @@
 """
-Burgers equation solver for data generation.
+1D Burgers Equation Solver
 
-Implements a GPU-accelerated 1D Burgers' equation solver using a semi-implicit Fourier method.
-Solves u_t + u * u_x = nu * u_xx with periodic boundary conditions.
+This module provides a GPU-accelerated solver for the 1D Burgers equation.
+Extracted from old_scripts/Burgers_KdV/burgers_solver.py for clean organization.
+
+The solver uses a semi-implicit Fourier method:
+- Linear diffusion term: implicit treatment (stable)
+- Nonlinear advection term: explicit treatment
 """
 
-import torch
-import torch.nn.functional as F
 import numpy as np
+import torch
 from tqdm import tqdm
-import os
-from typing import Optional, Tuple
 
 
 class BurgersSolver:
     """
     GPU-accelerated 1D Burgers' equation solver using a semi-implicit Fourier method.
-    Solves u_t + u * u_x = nu * u_xx
-    
-    The linear diffusion term (-nu * k^2 * û) is treated implicitly.
-    The nonlinear advection term is treated explicitly using dealiasing.
+
+    Solves: u_t + u * u_x = nu * u_xx
+
+    In Fourier space:
+    û_t + F(u * u_x) = -nu * k^2 * û
+    û_t = -nu * k^2 * û - 0.5 * ik * F(u^2)
+
+    The linear diffusion term is treated implicitly (stable).
+    The nonlinear advection term is treated explicitly.
+
+    Args:
+        N: Number of spatial grid points
+        width: Spatial domain width
+        nu: Viscosity parameter
+        device: Computing device ('cpu' or 'cuda:X')
     """
-    
-    def __init__(self, N: int = 512, width: float = 2*np.pi, nu: float = 0.01, device: str = "cpu"):
-        """
-        Initialize the Burgers solver.
-        
-        Args:
-            N: Number of spatial points
-            width: Spatial domain width
-            nu: Viscosity coefficient  
-            device: Device to run computations on
-        """
+
+    def __init__(self, N=256, width=2*np.pi, nu=0.01, device="cpu"):
         self.N = N
         self.width = width
         self.dx = width / N
@@ -40,7 +43,8 @@ class BurgersSolver:
 
         # Wavenumbers for spectral differentiation
         k = 2 * np.pi * torch.fft.fftfreq(N, d=self.dx).to(device)
-        self.k = k.view(1, 1, -1)  # Shape for broadcasting over batches
+        # Reshape for broadcasting over batches and channels
+        self.k = k.view(1, 1, -1)
         self.ik = 1j * self.k
 
         # Precompute the linear operator for the semi-implicit scheme
@@ -55,194 +59,228 @@ class BurgersSolver:
         """A single step using semi-implicit Euler."""
         u_hat = torch.fft.fft(u, dim=-1)
         nonlinear_hat = self._nonlinear_term_hat(u)
-        
+
         # Denominator for the implicit update of the linear term
         denominator = 1.0 - dt * self.linear_operator
-        
+
         # Update in Fourier space
         u_hat_next = (u_hat + dt * nonlinear_hat) / denominator
-        
-        # Dealiasing: Zero out the highest 1/3 of frequencies
+
+        # Dealiasing: Zero out the highest 1/3 of frequencies to prevent aliasing instability
         k_max_dealias = int(self.N * (1 / 3))
         u_hat_next[..., k_max_dealias:-k_max_dealias] = 0
 
         # Return to real space
         return torch.fft.ifft(u_hat_next, dim=-1).real
 
-    def integrate(self, u0: torch.Tensor, t_eval: torch.Tensor) -> Optional[torch.Tensor]:
+    def integrate(self, u0, t_eval):
         """
         Integrates a batch of initial conditions.
-        
+
         Args:
             u0: Initial conditions, shape (batch_size, N) or (batch_size, 1, N)
-            t_eval: Time points to evaluate at, shape (n_time,)
-            
+            t_eval: 1D tensor of time points
+
         Returns:
-            Solution tensor of shape (batch_size, n_time, N) or None if divergence occurs
+            Solution tensor (batch_size, time, N) or None if divergence occurs
         """
         if len(u0.shape) == 2:
             u0 = u0.unsqueeze(1)  # Add channel dim: (batch, 1, N)
 
         u = u0
-        sol = [u.squeeze(1)]  # Remove channel dim for storage
+        sol = [u.squeeze(1)]  # Squeeze out channel dim for storage
 
-        for i in range(len(t_eval) - 1):
+        pbar = tqdm(range(len(t_eval) - 1), desc=f"Integrating on {u.device}", leave=False)
+        for i in pbar:
             dt = t_eval[i + 1] - t_eval[i]
             u = self._step(u, dt)
 
             # Check for divergence
             if not torch.isfinite(u).all():
-                print(f"WARNING: Divergence detected at time step {i}")
-                return None
+                print(f"\\nWARNING: Divergence detected on device {u.device} at time step {i}. Aborting batch.")
+                return None  # Indicate failure
 
             sol.append(u.squeeze(1))
 
         return torch.stack(sol, dim=1)  # (batch, time, N)
 
     def get_kinetic_energy(self, u):
-        """Total kinetic energy E = ∫(1/2 * u^2) dx."""
+        """
+        Total kinetic energy E = ∫(1/2 * u^2) dx
+
+        Args:
+            u: Solution field(s)
+
+        Returns:
+            Kinetic energy tensor
+        """
         integrand = 0.5 * u**2
         return integrand.sum(dim=-1) * self.dx
 
 
-def generate_initial_conditions(n_samples: int, N: int = 256, device: str = "cpu", ic_type: str = 'random', scale: float = 1.0, seed: int = None) -> torch.Tensor:
+def generate_burgers_initial_conditions(num_runs, N, ic_type='random', width=2*np.pi, scale=1.0, seed=None, device="cpu"):
     """
-    Generate random initial conditions for Burgers equation.
-    
+    Generate initial conditions for Burgers equation
+
     Args:
-        n_samples: Number of initial conditions to generate
-        N: Number of spatial points
-        device: Device to generate on
-        ic_type: Type of initial condition ('random' or 'sine')
-        scale: Scale of the initial condition
+        num_runs: Number of initial conditions to generate
+        N: Number of spatial grid points
+        ic_type: Type of initial conditions ('random' or 'sine')
+        width: Spatial domain width
+        scale: Scaling factor for initial conditions
         seed: Random seed for reproducibility
-        
+        device: Computing device
+
     Returns:
-        Initial conditions tensor of shape (n_samples, N)
+        Tensor of initial conditions (num_runs, N)
     """
     if seed is not None:
         torch.manual_seed(seed)
-    
+
     if ic_type == 'random':
         # Create a uniform distribution in the range [-scale, scale)
-        ics = 2 * scale * torch.rand(n_samples, N, device=device) - scale
+        ics = 2 * scale * torch.rand(num_runs, N, device=device) - scale
     elif ic_type == 'sine':
-        x = torch.linspace(0, 2*np.pi, N + 1, device=device)[:-1]
-        ics = torch.zeros(n_samples, N, device=device)
-        for i in range(n_samples):
+        x = torch.linspace(0, width, N + 1, device=device)[:-1]
+        ics = torch.zeros(num_runs, N, device=device)
+        for i in range(num_runs):
             phase = 2 * np.pi * torch.rand(1).item()
             ics[i, :] = scale * torch.sin(x + phase)
     else:
         raise ValueError(f"Unknown initial condition type: {ic_type}")
-        
+
     return ics
 
 
-def generate_burgers_data(
-    n_train: int = 1000,
-    n_test: int = 200, 
-    N: int = 512,
-    T: float = 2.5,
-    dt: float = 1e-4,
-    nu: float = 0.01,
-    device: str = "cpu",
-    save_path: Optional[str] = None,
-    ic_type: str = 'random',
-    ic_scale: float = 1.0,
-    seed: int = None
-) -> Tuple[dict, dict]:
+def run_burgers_simulation_batch(solver, ics, T, dt, save_interval):
     """
-    Generate training and test datasets for Burgers equation.
-    
+    Run a batch of Burgers simulations and compute statistics
+
     Args:
-        n_train: Number of training samples
-        n_test: Number of test samples
-        N: Number of spatial points
+        solver: BurgersSolver instance
+        ics: Initial conditions (batch_size, N)
         T: Final time
-        dt: Time step size
-        nu: Viscosity coefficient
-        device: Device to run on
-        save_path: Path to save data (optional)
-        ic_type: Type of initial condition ('random' or 'sine')
-        ic_scale: Scale of the initial condition
-        seed: Random seed for reproducibility
-        
+        dt: Time step
+        save_interval: Interval for saving snapshots
+
     Returns:
-        Tuple of (train_data, test_data) dictionaries
+        List of results dictionaries for each simulation
     """
-    print(f"Generating Burgers equation data...")
-    print(f"Parameters: N={N}, T={T}, dt={dt}, nu={nu}")
-    print(f"Train samples: {n_train}, Test samples: {n_test}")
-    
-    # Time evaluation points
-    t_eval = torch.arange(0, T + dt, dt, device=device)
-    n_time = len(t_eval)
-    
-    # Initialize solver
-    solver = BurgersSolver(N=N, nu=nu, device=device)
-    
-    def generate_dataset(n_samples, desc):
-        # Generate initial conditions
-        u0 = generate_initial_conditions(n_samples, N, device, ic_type, ic_scale, seed)
-        
-        # Solve in batches to manage memory
-        batch_size = min(50, n_samples)
-        all_solutions = []
-        
-        for i in tqdm(range(0, n_samples, batch_size), desc=desc):
-            end_idx = min(i + batch_size, n_samples)
-            batch_u0 = u0[i:end_idx]
-            
-            # Integrate
-            sol = solver.integrate(batch_u0, t_eval)
-            if sol is None:
-                raise RuntimeError(f"Integration failed for batch {i//batch_size}")
-                
-            all_solutions.append(sol.cpu())
-        
-        return {
-            'u': torch.cat(all_solutions, dim=0),  # (n_samples, n_time, N)
-            't': t_eval.cpu(),                     # (n_time,)
-            'x': torch.linspace(0, 2*np.pi, N),   # (N,)
-            'nu': nu,
-            'dt': dt
-        }
-    
-    # Generate datasets
-    train_data = generate_dataset(n_train, "Generating train data")
-    test_data = generate_dataset(n_test, "Generating test data")
-    
-    # Save if requested
-    if save_path:
-        os.makedirs(save_path, exist_ok=True)
-        torch.save(train_data, os.path.join(save_path, 'burgers_train.pt'))
-        torch.save(test_data, os.path.join(save_path, 'burgers_test.pt'))
-        print(f"Data saved to {save_path}")
-    
-    print("Data generation complete!")
-    return train_data, test_data
+    # Time points for integration and saving
+    t_eval = torch.arange(0, T + dt, dt, device=solver.device)
+    save_times = torch.arange(0, T + save_interval, save_interval, device=solver.device)
+
+    # Run integration
+    snapshots = solver.integrate(ics, t_eval)
+
+    if snapshots is None:
+        return [{"status": "failed", "error_message": "Divergence during integration"} for _ in range(ics.shape[0])]
+
+    # Downsample to save_times
+    save_indices = torch.searchsorted(t_eval, save_times)
+    save_indices.clamp_max_(snapshots.shape[1] - 1)
+    saved_snapshots = snapshots[:, save_indices, :]
+
+    # Compute physical quantities for each saved snapshot
+    energy_t = solver.get_kinetic_energy(saved_snapshots)
+
+    results = []
+    for i in range(ics.shape[0]):
+        results.append({
+            "status": "success",
+            "snapshots": saved_snapshots[i].cpu(),
+            "times": save_times.cpu(),
+            "energy_t": energy_t[i].cpu(),
+        })
+    return results
 
 
-def load_burgers_data(data_path: str) -> Tuple[dict, dict]:
-    """Load Burgers equation data from saved files."""
-    train_data = torch.load(os.path.join(data_path, 'burgers_train.pt'))
-    test_data = torch.load(os.path.join(data_path, 'burgers_test.pt'))
-    return train_data, test_data
+def generate_burgers_dataset(
+    num_runs=100,
+    N=512,
+    width=2*np.pi,
+    nu=0.01,
+    T=20.0,
+    dt=1e-4,
+    save_interval=0.05,
+    ic_type='random',
+    ic_scale=1.0,
+    batch_size=32,
+    device='cpu',
+    seed=None,
+    save_dir='data/Burgers'
+):
+    """
+    Generate a complete Burgers dataset
 
+    Args:
+        num_runs: Number of simulations to run
+        N: Spatial grid points
+        width: Spatial domain width
+        nu: Viscosity
+        T: Final time
+        dt: Time step for integration
+        save_interval: Time interval for saving snapshots
+        ic_type: Type of initial conditions
+        ic_scale: Scale of initial conditions
+        batch_size: Batch size for processing
+        device: Computing device
+        seed: Random seed
+        save_dir: Directory to save results
 
-if __name__ == "__main__":
-    # Example usage
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_data, test_data = generate_burgers_data(
-        n_train=100,  # Small example
-        n_test=20,
-        device=device,
-        save_path="data",
-        ic_type='random',  # Use uniform random noise like your script
-        ic_scale=1.0,
-        seed=42
+    Returns:
+        Dictionary with dataset statistics
+    """
+    import os
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Create solver
+    solver = BurgersSolver(N=N, width=width, nu=nu, device=device)
+
+    # Generate initial conditions
+    print(f"Generating {num_runs} Burgers initial conditions...")
+    all_ics = generate_burgers_initial_conditions(
+        num_runs, N, ic_type=ic_type, width=width,
+        scale=ic_scale, seed=seed, device='cpu'  # Generate on CPU first
     )
-    
-    print(f"Train data shape: {train_data['u'].shape}")
-    print(f"Test data shape: {test_data['u'].shape}")
-    print(f"Time points: {len(train_data['t'])}")
+
+    # Process in batches
+    successful_runs = 0
+    failed_runs = 0
+
+    print(f"Running {num_runs} Burgers simulations...")
+    for i in tqdm(range(0, num_runs, batch_size), desc="Processing batches"):
+        batch_end = min(i + batch_size, num_runs)
+        batch_ics = all_ics[i:batch_end].to(device)
+
+        # Run batch simulation
+        batch_results = run_burgers_simulation_batch(
+            solver, batch_ics, T, dt, save_interval
+        )
+
+        # Save individual results
+        for j, result in enumerate(batch_results):
+            run_id = i + j
+            result['run_id'] = run_id
+
+            if result['status'] == 'success':
+                save_path = os.path.join(save_dir, f"run_{run_id:05d}.pt")
+                torch.save(result, save_path)
+                successful_runs += 1
+            else:
+                failed_runs += 1
+
+    stats = {
+        'total_runs': num_runs,
+        'successful_runs': successful_runs,
+        'failed_runs': failed_runs,
+        'success_rate': successful_runs / num_runs,
+        'parameters': {
+            'N': N, 'width': width, 'nu': nu, 'T': T,
+            'dt': dt, 'save_interval': save_interval,
+            'ic_type': ic_type, 'ic_scale': ic_scale
+        }
+    }
+
+    print(f"Dataset generation complete: {successful_runs}/{num_runs} successful")
+    return stats
